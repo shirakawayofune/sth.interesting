@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Tap Sound Visual Toy</title>
+  <style>
+    :root{
+      --bg:#0b1020;
+      --fg:#e6f0ff;
+      --accent:#6cf;
+      --panel:rgba(255,255,255,.08);
+    }
+    html,body{height:100%;}
+    body{
+      margin:0; background: radial-gradient(1200px 800px at 70% 10%, #122, var(--bg));
+      color:var(--fg); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+      overflow:hidden;
+    }
+    canvas{display:block; width:100vw; height:100vh;}
+    .hud{
+      position:fixed; inset:0; pointer-events:none; display:flex; flex-direction:column; justify-content:space-between;
+    }
+    .topbar, .bottombar{ display:flex; justify-content:space-between; align-items:center; padding:10px 14px; gap:10px; }
+    .panel{ pointer-events:auto; background:var(--panel); backdrop-filter: blur(6px); border:1px solid rgba(255,255,255,.08); border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.35); }
+    .logo{ padding:10px 14px; font-weight:700; letter-spacing:.5px; }
+    .controls{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; padding:8px; }
+    .chip{ display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:12px; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.08); font-size:12px; }
+    .btn{ cursor:pointer; user-select:none; padding:8px 12px; border-radius:12px; border:1px solid rgba(255,255,255,.12); background:rgba(108,204,255,.15); color:#dff2ff; transition:.2s transform, .2s background; }
+    .btn:hover{ transform:translateY(-1px); }
+    .btn:active{ transform:translateY(0); }
+    .slider{ appearance:none; height:6px; border-radius:6px; background:rgba(255,255,255,.18); outline:none; }
+    .slider::-webkit-slider-thumb{ -webkit-appearance:none; width:16px; height:16px; border-radius:50%; background:var(--accent); border:2px solid white; box-shadow:0 2px 10px rgba(0,0,0,.4); cursor:pointer; }
+    .help{ max-width:520px; line-height:1.45; padding:10px 14px; font-size:14px; }
+    .kbd{ font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:rgba(255,255,255,.09); padding:2px 6px; border-radius:6px; border:1px solid rgba(255,255,255,.15); }
+    .centerHint{ position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); text-align:center; opacity:.9; pointer-events:none; }
+    .pulse{ animation:pulse 1.8s ease-in-out infinite; }
+    @keyframes pulse { 0%,100%{ transform:translate(-50%,-50%) scale(1); opacity:.75;} 50%{ transform:translate(-50%,-50%) scale(1.08); opacity:1; } }
+    .link{ color:#aee3ff; text-decoration:none; border-bottom:1px dashed rgba(174,227,255,.6); }
+  </style>
+</head>
+<body>
+  <canvas id="stage"></canvas>
+
+  <!-- HUD -->
+  <div class="hud">
+    <div class="topbar">
+      <div class="panel logo">Tap Sound Visual Toy</div>
+      <div class="panel controls">
+        <button class="btn" id="btnStart">启动音频</button>
+        <button class="btn" id="btnClear">清屏</button>
+        <label class="chip"><input type="checkbox" id="chkEcho"> 回声</label>
+        <label class="chip"><input type="checkbox" id="chkLP"> 低通滤波</label>
+        <label class="chip">音量 <input id="vol" class="slider" type="range" min="0" max="1" step="0.001" value="0.6"/></label>
+      </div>
+    </div>
+    <div class="bottombar">
+      <div class="panel help">
+        点击 / 触摸屏幕会产生不同音色与动画。横向位置决定<strong>音高</strong>，纵向位置影响<strong>音量/滤波</strong>。<br>
+        也可使用键盘: <span class="kbd">A S D F G H J</span> 主音阶，<span class="kbd">W E T Y U</span> 升号。<br>
+        完整自包含单文件（无外部素材）——用 Web Audio 合成器 + Canvas 粒子可视化。
+      </div>
+      <div class="panel help">保存为 <span class="kbd">index.html</span> 后，直接浏览器打开或部署到 GitHub Pages 即可。</div>
+    </div>
+  </div>
+
+  <div class="centerHint pulse" id="hint">
+    <div class="panel" style="padding:14px 18px; font-size:16px;">🔊 先点击“启动音频”或在画面上点一下以激活音频权限</div>
+  </div>
+
+  <script>
+  // ========== Canvas Setup ==========
+  const canvas = document.getElementById('stage');
+  const ctx = canvas.getContext('2d');
+  function resize(){ canvas.width = innerWidth * devicePixelRatio; canvas.height = innerHeight * devicePixelRatio; canvas.style.width = innerWidth + 'px'; canvas.style.height = innerHeight + 'px'; ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0); }
+  addEventListener('resize', resize); resize();
+
+  // ========== Audio Graph ==========
+  let actx, master, limiter, gainMain, echo, echoGain, lpFilter;
+  let started = false;
+
+  function ensureAudio(){
+    if (started) return;
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+
+    // Nodes
+    master = actx.destination;
+
+    // Simple soft limiter using DynamicsCompressor
+    limiter = actx.createDynamicsCompressor();
+    limiter.threshold.value = -8; // dB
+    limiter.knee.value = 8;
+    limiter.ratio.value = 12;
+    limiter.attack.value = 0.003;
+    limiter.release.value = 0.08;
+
+    // Master gain
+    gainMain = actx.createGain();
+    gainMain.gain.value = parseFloat(document.getElementById('vol').value);
+
+    // Optional LP filter
+    lpFilter = actx.createBiquadFilter();
+    lpFilter.type = 'lowpass';
+    lpFilter.frequency.value = 20000;
+    lpFilter.Q.value = 0.7;
+
+    // Echo (feedback delay)
+    echo = actx.createDelay(1.2);
+    echo.delayTime.value = 0.28;
+    echoGain = actx.createGain();
+    echoGain.gain.value = 0.28;
+
+    // Routing: synth -> lp -> [echo loop optional] -> gain -> limiter -> out
+    lpFilter.connect(gainMain);
+    gainMain.connect(limiter);
+    limiter.connect(master);
+
+    // Echo loop wiring but disabled by default
+    lpFilter.connect(echo);
+    echo.connect(echoGain);
+    echoGain.connect(lpFilter); // feedback path; will be toggled via checkbox gain
+
+    started = true;
+    document.getElementById('hint').style.display = 'none';
+  }
+
+  // ========== Synth Helpers ==========
+  // MIDI to frequency
+  const mtof = m => 440 * Math.pow(2, (m-69)/12);
+  // Scales: C major relative
+  const major = [0,2,4,5,7,9,11,12];
+
+  function mapXToPitch(x){
+    const cols = 16; // more columns -> finer control
+    const col = Math.max(0, Math.min(cols-1, Math.floor((x / innerWidth) * cols)));
+    const base = 60; // C4
+    const note = base + col; // chromatic
+    return note;
+  }
+
+  function voice({x, y, type='auto'}){
+    ensureAudio();
+    const t0 = actx.currentTime;
+
+    // choose waveform by x sector, or random
+    const sector = Math.floor((x / innerWidth) * 4);
+    const waves = ['sine','triangle','sawtooth','square'];
+    const wave = type === 'auto' ? waves[sector] : type;
+
+    const midi = mapXToPitch(x);
+    const freq = mtof(midi);
+
+    // Synthesis chain for this voice
+    const osc = actx.createOscillator();
+    osc.type = wave;
+    osc.frequency.setValueAtTime(freq, t0);
+
+    // Sub oscillator (one octave below) for body
+    const sub = actx.createOscillator();
+    sub.type = 'sine';
+    sub.frequency.setValueAtTime(freq / 2, t0);
+    const subGain = actx.createGain();
+    subGain.gain.setValueAtTime(0.08, t0);
+
+    // Amplitude envelope
+    const amp = actx.createGain();
+    const vel = 0.15 + 0.85 * (1 - y / innerHeight); // higher click -> softer; lower -> louder
+    const A=0.005, D=0.08, S=0.35, R=0.4;
+    amp.gain.setValueAtTime(0, t0);
+    amp.gain.linearRampToValueAtTime(vel, t0 + A);
+    amp.gain.linearRampToValueAtTime(vel * S, t0 + A + D);
+    amp.gain.setTargetAtTime(0, t0 + A + D + 0.05, R);
+
+    // Gentle filter envelope tied to Y
+    const filt = actx.createBiquadFilter();
+    filt.type = 'lowpass';
+    const baseCut = 400 + (1 - y/innerHeight) * 16000; // top => brighter
+    filt.frequency.setValueAtTime(Math.max(200, baseCut), t0);
+    filt.Q.value = 0.8;
+
+    // Stereo panning by x
+    const panner = actx.createStereoPanner();
+    panner.pan.setValueAtTime((x / innerWidth) * 2 - 1, t0);
+
+    // Connect chain
+    osc.connect(amp);
+    sub.connect(subGain);
+    subGain.connect(amp);
+    amp.connect(filt);
+    filt.connect(lpFilter);
+
+    // Pitch glide for a playful effect
+    osc.frequency.exponentialRampToValueAtTime(freq * 1.003, t0 + 0.12);
+
+    // Optional ring of short noise for percussive click
+    noiseClick(t0, 0.03, panner, 0.02, x);
+
+    // Start/stop
+    osc.start(t0);
+    sub.start(t0);
+    osc.stop(t0 + 1.2);
+    sub.stop(t0 + 1.2);
+
+    // Visuals
+    spawnBurst(x, y, freq);
+  }
+
+  function noiseClick(t0, dur, target, gain=0.05, x=0){
+    const buf = actx.createBuffer(1, actx.sampleRate * dur, actx.sampleRate);
+    const data = buf.getChannelData(0);
+    for(let i=0;i<data.length;i++){ data[i] = (Math.random()*2-1) * Math.pow(1 - i/data.length, 2); }
+    const src = actx.createBufferSource(); src.buffer = buf;
+    const g = actx.createGain(); g.gain.value = gain;
+    const pan = actx.createStereoPanner(); pan.pan.value = (x / innerWidth)*2-1;
+    src.connect(g); g.connect(pan); pan.connect(lpFilter);
+    src.start(t0);
+  }
+
+  // Drum synthesizers (procedural) for keyboard extras
+  function kick(){ ensureAudio(); const t=actx.currentTime; const osc=actx.createOscillator(); const g=actx.createGain(); osc.type='sine'; osc.frequency.setValueAtTime(130,t); osc.frequency.exponentialRampToValueAtTime(50, t+0.12); g.gain.setValueAtTime(0.9,t); g.gain.exponentialRampToValueAtTime(0.0001, t+0.3); osc.connect(g); g.connect(lpFilter); osc.start(); osc.stop(t+0.32); spawnBurst(innerWidth*0.1, innerHeight*0.85, 60, 10); }
+  function snare(){ ensureAudio(); const t=actx.currentTime; const dur=0.15; const buf=actx.createBuffer(1, actx.sampleRate*dur, actx.sampleRate); const data=buf.getChannelData(0); for(let i=0;i<data.length;i++){ data[i]=(Math.random()*2-1)*Math.pow(1-i/data.length,1.5);} const src=actx.createBufferSource(); src.buffer=buf; const filt=actx.createBiquadFilter(); filt.type='highpass'; filt.frequency.value=1500; const g=actx.createGain(); g.gain.value=0.25; src.connect(filt); filt.connect(g); g.connect(lpFilter); src.start(); spawnBurst(innerWidth*0.5, innerHeight*0.9, 2000, 12); }
+  function hat(){ ensureAudio(); const t=actx.currentTime; const dur=0.05; const buf=actx.createBuffer(1, actx.sampleRate*dur, actx.sampleRate); const data=buf.getChannelData(0); for(let i=0;i<data.length;i++){ data[i]=(Math.random()*2-1);} const src=actx.createBufferSource(); src.buffer=buf; const filt=actx.createBiquadFilter(); filt.type='highpass'; filt.frequency.value=5000; const g=actx.createGain(); g.gain.value=0.12; src.connect(filt); filt.connect(g); g.connect(lpFilter); src.start(); spawnBurst(innerWidth*0.85, innerHeight*0.82, 7000, 8); }
+
+  // ========== Input Handling ==========
+  const btnStart = document.getElementById('btnStart');
+  btnStart.addEventListener('click', ensureAudio);
+  window.addEventListener('pointerdown', (e)=>{ ensureAudio(); const rect = canvas.getBoundingClientRect(); voice({x: e.clientX - rect.left, y: e.clientY - rect.top}); });
+
+  // Keyboard mapping: C major row + drums
+  const keyMap = {
+    'a':60,'w':61,'s':62,'e':63,'d':64,'f':65,'t':66,'g':67,'y':68,'h':69,'u':70,'j':71,'k':72,
+  };
+  window.addEventListener('keydown', (e)=>{
+    if (e.repeat) return;
+    const k = e.key.toLowerCase();
+    if (k in keyMap){ ensureAudio(); const x = (keyMap[k]-60)/12 * innerWidth; const y = innerHeight*0.6; voice({x,y}); }
+    else if (k===' '){ kick(); }
+    else if (k===';'){ snare(); }
+    else if (k==="'") { hat(); }
+  });
+
+  // Controls
+  document.getElementById('vol').addEventListener('input', (e)=>{ ensureAudio(); gainMain.gain.value = parseFloat(e.target.value); });
+  document.getElementById('chkEcho').addEventListener('change', (e)=>{ ensureAudio(); echoGain.gain.value = e.target.checked ? 0.28 : 0.0; });
+  document.getElementById('chkLP').addEventListener('change', (e)=>{ ensureAudio(); lpFilter.frequency.value = e.target.checked ? 1800 : 20000; });
+  document.getElementById('btnClear').addEventListener('click', ()=>{ particles.length = 0; ripples.length = 0; });
+
+  // ========== Visuals ==========
+  const particles = [];
+  const ripples = [];
+
+  function spawnBurst(x, y, freq, count=20){
+    const hue = (freq/40) % 360;
+    for(let i=0;i<count;i++){
+      const ang = Math.random()*Math.PI*2;
+      const spd = 1 + Math.random()*4;
+      particles.push({x,y, vx: Math.cos(ang)*spd, vy: Math.sin(ang)*spd, life: 0, max: 1+Math.random()*1.2, size: 2 + Math.random()*3, hue});
+    }
+    ripples.push({x,y,r:0, a:1, hue});
+  }
+
+  function step(dt){
+    // fade background
+    ctx.fillStyle = 'rgba(11,16,32,0.18)';
+    ctx.fillRect(0,0,innerWidth,innerHeight);
+
+    // particles
+    for(let i=particles.length-1;i>=0;i--){
+      const p = particles[i];
+      p.life += dt; if (p.life>p.max){ particles.splice(i,1); continue; }
+      p.vy += 0.03; // gravity
+      p.x += p.vx; p.y += p.vy;
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size*(1-p.life/p.max), 0, Math.PI*2);
+      ctx.fillStyle = `hsla(${p.hue}, 90%, 60%, ${1-p.life/p.max})`;
+      ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    // ripples
+    for(let i=ripples.length-1;i>=0;i--){
+      const r = ripples[i];
+      r.r += 6; r.a *= 0.96;
+      ctx.beginPath();
+      ctx.arc(r.x, r.y, r.r, 0, Math.PI*2);
+      ctx.strokeStyle = `hsla(${r.hue}, 90%, 70%, ${r.a})`;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      if (r.a < 0.02) ripples.splice(i,1);
+    }
+  }
+
+  let last=performance.now();
+  function loop(now){ const dt = Math.min(0.05, (now-last)/1000); last=now; step(dt); requestAnimationFrame(loop); }
+  requestAnimationFrame(loop);
+
+  // Initial paint (clear)
+  ctx.fillStyle = 'rgba(0,0,0,1)'; ctx.fillRect(0,0,innerWidth,innerHeight);
+  </script>
+</body>
+</html>
